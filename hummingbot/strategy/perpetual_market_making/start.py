@@ -46,6 +46,10 @@ def start(self):
         order_refresh_tolerance_pct = c_map.get("order_refresh_tolerance_pct").value / Decimal('100')
         order_override = c_map.get("order_override").value
 
+        # zdt configuration
+        time_waiting_to_adjust_order_price = c_map.get("time_waiting_to_adjust_order_price").value
+        time_waiting_to_calculate_peak_bid_ask_after_price_jump = c_map.get("time_waiting_to_calculate_peak_bid_ask_after_price_jump").value
+
         trading_pair: str = raw_trading_pair
         maker_assets: Tuple[str, str] = self._initialize_market_assets(exchange, [trading_pair])[0]
         market_names: List[Tuple[str, List[str]]] = [(exchange, [trading_pair])]
@@ -99,6 +103,9 @@ def start(self):
             minimum_spread=minimum_spread,
             hb_app_notification=True,
             order_override=order_override,
+            # zdt configuration
+            time_waiting_to_calculate_peak_bid_ask_after_price_jump = time_waiting_to_calculate_peak_bid_ask_after_price_jump,
+            time_waiting_to_adjust_order_price=time_waiting_to_adjust_order_price
         )
     except Exception as e:
         self.notify(str(e))

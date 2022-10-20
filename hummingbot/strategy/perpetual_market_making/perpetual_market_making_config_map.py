@@ -202,6 +202,22 @@ perpetual_market_making_config_map = {
                   default=60,
                   validator=lambda v: validate_decimal(v, 0, inclusive=False),
                   prompt_on_new=True),
+    "time_waiting_to_adjust_order_price":
+        ConfigVar(key="time_waiting_to_adjust_order_price",
+                  prompt="How much time should pass before adjust order price? ("
+                         "in seconds) >>> ",
+                  type_str="float",
+                  default=60,
+                  validator=lambda v: validate_decimal(v, 0, inclusive=False),
+                  prompt_on_new=True),
+    "time_waiting_to_calculate_peak_bid_ask_after_price_jump":
+        ConfigVar(key="time_waiting_to_calculate_peak_bid_ask_after_price_jump",
+                  prompt="How much time should pass before setting new price range? ("
+                         "in seconds) >>> ",
+                  type_str="float",
+                  default=60,
+                  validator=lambda v: validate_decimal(v, 0, inclusive=False),
+                  prompt_on_new=True),
     "stop_loss_slippage_buffer":
         ConfigVar(key="stop_loss_slippage_buffer",
                   prompt="How much buffer should be added in stop loss orders' price to account for slippage? (Enter 1 for 1%)? >>> ",

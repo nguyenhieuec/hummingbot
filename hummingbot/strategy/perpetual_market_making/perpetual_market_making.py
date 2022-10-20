@@ -9,6 +9,8 @@ import pandas as pd
 
 from hummingbot.connector.derivative.position import Position
 from hummingbot.connector.derivative_base import DerivativeBase
+from hummingbot.core.clock import Clock
+from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.core.data_type.common import OrderType, PositionAction, PositionMode, PriceType, TradeType
 from hummingbot.core.data_type.limit_order import LimitOrder
 from hummingbot.core.data_type.order_candidate import PerpetualOrderCandidate
@@ -20,6 +22,7 @@ from hummingbot.core.event.events import (
 )
 from hummingbot.core.network_iterator import NetworkStatus
 from hummingbot.core.utils import map_df_to_str
+from hummingbot.strategy.__utils__.trailing_indicators.peak_bid_ask import PeakBidAsk
 from hummingbot.strategy.asset_price_delegate import AssetPriceDelegate
 from hummingbot.strategy.market_trading_pair_tuple import MarketTradingPairTuple
 from hummingbot.strategy.order_book_asset_price_delegate import OrderBookAssetPriceDelegate
@@ -59,6 +62,10 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
                     short_profit_taking_spread: Decimal,
                     stop_loss_spread: Decimal,
                     time_between_stop_loss_orders: float,
+
+                    time_waiting_to_adjust_order_price: Decimal,
+                    time_waiting_to_calculate_peak_bid_ask_after_price_jump: Decimal,
+
                     stop_loss_slippage_buffer: Decimal,
                     order_levels: int = 1,
                     order_level_spread: Decimal = s_decimal_zero,
@@ -83,6 +90,7 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
         if price_ceiling != s_decimal_neg_one and price_ceiling < price_floor:
             raise ValueError("Parameter price_ceiling cannot be lower than price_floor.")
 
+        # input parameter
         self._sb_order_tracker = PerpetualMarketMakingOrderTracker()
         self._market_info = market_info
         self._leverage = leverage
@@ -111,9 +119,22 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
         self._price_floor = price_floor
         self._hb_app_notification = hb_app_notification
         self._order_override = order_override
+        self._time_waiting_to_adjust_order_price = time_waiting_to_adjust_order_price
+        self._time_waiting_to_calculate_peak_bid_ask_after_price_jump = time_waiting_to_calculate_peak_bid_ask_after_price_jump
 
+        # self parameter
         self._cancel_timestamp = 0
         self._create_timestamp = 0
+
+        self._peak_indicator = PeakBidAsk(sampling_length=200)
+        self._last_peak_ask_spread = 0.0
+        self._last_peak_bid_spread = 0.0
+        self._modify_out_price_timestamp = 0
+        self._last_long_profit_taking_spread = Decimal(0.0)
+        self._last_short_profit_taking_spread = Decimal(0.0)
+        self._origin_long_profit_taking_spread = long_profit_taking_spread
+        self._origin_short_profit_taking_spread = short_profit_taking_spread
+        self._is_modify_taking_spread = False
         self._all_markets_ready = False
         self._logging_options = logging_options
         self._last_timestamp = 0
@@ -124,13 +145,10 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
         self._exit_orders = dict()
         self._next_buy_exit_order_timestamp = 0
         self._next_sell_exit_order_timestamp = 0
-
         self.add_markets([market_info.market])
-
         self._close_order_type = OrderType.LIMIT
         self._time_between_stop_loss_orders = time_between_stop_loss_orders
         self._stop_loss_slippage_buffer = stop_loss_slippage_buffer
-
         self._position_mode_ready = False
         self._position_mode_not_ready_counter = 0
 
@@ -444,6 +462,16 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
 
         return "\n".join(lines)
 
+    def start(self, clock: Clock, timestamp: float):
+        super().start(clock, timestamp)
+        self._last_timestamp = timestamp
+        self.apply_initial_settings(self.trading_pair, self._position_mode, self._leverage)
+
+    def apply_initial_settings(self, trading_pair: str, position: Position, leverage: int):
+        market: DerivativeBase = self._market_info.market
+        market.set_leverage(trading_pair, leverage)
+        market.set_position_mode(position)
+
     def tick(self, timestamp: float):
         if not self._position_mode_ready:
             self._position_mode_not_ready_counter += 1
@@ -501,6 +529,7 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
                 self._ts_peak_ask_price = market.get_price(self.trading_pair, False)
                 self._ts_peak_bid_price = market.get_price(self.trading_pair, True)
             else:
+                self._peak_indicator.add_sample(float(self.get_mid_price()))
                 self.manage_positions(session_positions)
         finally:
             self._last_timestamp = timestamp
@@ -524,6 +553,7 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
                                 if o.client_order_id not in self._exit_orders.keys()]
         ask_price = market.get_price(self.trading_pair, True)
         bid_price = market.get_price(self.trading_pair, False)
+        # mid_price = self.get_mid_price()
         buys = []
         sells = []
 
@@ -547,19 +577,25 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
                     bid_price < position.entry_price and position.amount < 0):
                 # check if there is an active order to take profit, and create if none exists
                 profit_spread = self._long_profit_taking_spread if position.amount > 0 else self._short_profit_taking_spread
-                take_profit_price = position.entry_price * (Decimal("1") + profit_spread) if position.amount > 0 \
-                    else position.entry_price * (Decimal("1") - profit_spread)
-                price = market.quantize_order_price(self.trading_pair, take_profit_price)
-                size = market.quantize_order_amount(self.trading_pair, abs(position.amount))
-                old_exit_orders = [
-                    o for o in self.active_orders
-                    if ((o.price != price or o.quantity != size)
-                        and o.client_order_id in self._exit_orders.keys()
-                        and ((position.amount < 0 and o.is_buy) or (position.amount > 0 and not o.is_buy)))]
-                for old_order in old_exit_orders:
-                    self.cancel_order(self._market_info, old_order.client_order_id)
-                    self.logger().info(
-                        f"Initiated cancelation of previous take profit order {old_order.client_order_id} in favour of new take profit order.")
+                if self._modify_out_price_timestamp > self.current_timestamp:
+                    bid_price_out, ask_price_out = self._peak_indicator.position_exit_price_level()
+                    take_profit_price = ask_price_out if position.amount > 0 else bid_price_out
+                    price = market.quantize_order_price(self.trading_pair, take_profit_price)
+                    size = market.quantize_order_amount(self.trading_pair, abs(position.amount))
+                else:
+                    take_profit_price = position.entry_price * (Decimal("1") + profit_spread) if position.amount > 0 \
+                        else position.entry_price * (Decimal("1") - profit_spread)
+                    price = market.quantize_order_price(self.trading_pair, take_profit_price)
+                    size = market.quantize_order_amount(self.trading_pair, abs(position.amount))
+                    # old_exit_orders = [
+                    #     o for o in self.active_orders
+                    #     if ((o.price != price or o.quantity != size)
+                    #         and o.client_order_id in self._exit_orders.keys()
+                    #         and ((position.amount < 0 and o.is_buy) or (position.amount > 0 and not o.is_buy)))]
+                    # for old_order in old_exit_orders:
+                    #     self.cancel_order(self._market_info, old_order.client_order_id)
+                    #     self.logger().info(
+                    #         f"Initiated cancelation of previous take profit order {old_order.client_order_id} in favour of new take profit order.")
                 exit_order_exists = [o for o in self.active_orders if o.price == price]
                 if len(exit_order_exists) == 0:
                     if size > 0 and price > 0:
@@ -573,6 +609,9 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
         stop_loss_creation_timestamp = self._exit_orders.get(stop_loss_order.client_order_id)
         time_since_stop_loss = self.current_timestamp - stop_loss_creation_timestamp
         return time_since_stop_loss >= self._time_between_stop_loss_orders
+
+    def _should_modify_stop_loss_take_profit_spread(self):
+        pass
 
     def stop_loss_proposal(self, mode: PositionMode, active_positions: List[Position]) -> Proposal:
         market: DerivativeBase = self._market_info.market
@@ -820,6 +859,28 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
         self._cancel_timestamp = min(self._cancel_timestamp, self._create_timestamp)
 
         self._last_own_trade_price = limit_order_record.price
+        if not self.active_positions:
+            bid_price, _ = self._peak_indicator.position_exit_price_level()
+            price = self._market_info.market.quantize_order_price(self.trading_pair, bid_price)
+            self.logger().info(
+                f"_last_own_trade_price {self._last_own_trade_price}, bid_price {bid_price}, "
+                f"price after quantize_order_price {price}"
+            )
+
+            if price == self._last_own_trade_price:
+                self._long_profit_taking_spread = self._peak_indicator.current_value
+                self.log_with_clock(
+                    logging.INFO,
+                    f"Change long profit taking spread to {self._long_profit_taking_spread}"
+                )
+            else:
+                self._long_profit_taking_spread = self._origin_long_profit_taking_spread
+                self.log_with_clock(
+                    logging.INFO,
+                    f"Change long profit taking spread to {self._long_profit_taking_spread}"
+                )
+
+            self._peak_indicator.next_round()
 
         self.log_with_clock(
             logging.INFO,
@@ -843,6 +904,26 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
         self._cancel_timestamp = min(self._cancel_timestamp, self._create_timestamp)
 
         self._last_own_trade_price = limit_order_record.price
+
+        if not self.active_positions:
+            # TODO: if price == self._last_own_trade_price:
+            _, ask_price = self._peak_indicator.position_exit_price_level()
+            price = self._market_info.market.quantize_order_price(self.trading_pair, ask_price)
+
+            if price == self._last_own_trade_price:
+                self._short_profit_taking_spread = self._peak_indicator.current_value
+                self.log_with_clock(
+                    logging.INFO,
+                    f"Change short profit taking spread to {self._short_profit_taking_spread}"
+                )
+            else:
+                self._short_profit_taking_spread = self._origin_short_profit_taking_spread
+                self.log_with_clock(
+                    logging.INFO,
+                    f"Change long profit taking spread to {self._short_profit_taking_spread}"
+                )
+
+            self._peak_indicator.next_round()
 
         self.log_with_clock(
             logging.INFO,
@@ -980,6 +1061,7 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
                 orders_created = True
         if orders_created:
             self.set_timers()
+            self.set_modify_price_time()
 
     def set_timers(self):
         next_cycle = self.current_timestamp + self._order_refresh_time
@@ -987,6 +1069,11 @@ class PerpetualMarketMakingStrategy(StrategyPyBase):
             self._create_timestamp = next_cycle
         if self._cancel_timestamp <= self.current_timestamp:
             self._cancel_timestamp = min(self._create_timestamp, next_cycle)
+
+    def set_modify_price_time(self):
+        next_cycle = self.current_timestamp + self._time_waiting_to_adjust_order_price
+        if self._modify_out_price_timestamp <= self.current_timestamp:
+            self._modify_out_price_timestamp = next_cycle
 
     def notify_hb_app(self, msg: str):
         if self._hb_app_notification:
